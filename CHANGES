@@ -1,8 +1,12 @@
-v2.7 (unreleased)
+v2.7 (Jan 2, 2015)
 - openpgpkey: Add --keyid option to select key on keyid [Paul]
 - openpgpkey: fix --rootanchor option handling [Ondřej Surý]
 - openpgpkey: print keyid as bind zone style comment [Carsten Strotmann]
 - sshfp: Ignore 4th column in known_hosts [Jean-Michel Nirgal Vourgère]
+- sshfp: Demote obsoleted dss/dsa keys - warn if requested [Paul]
+- tlsa: Add support for SNI, allow port 25 certs for local files [Dirk Stöcker]
+- tlsa: Support --starttls for imap, pop3, smtp and ftp [Dirk Stöcker]
+- Remove DLV which is being sunset [Paul]
 
 v2.6 (Jan 6, 2015))
 - openpgpkey: Added --fetch option to fetch a public key from DNS [Paul]

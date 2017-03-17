@@ -1,34 +1,41 @@
 #!/usr/bin/python
 
 # tlsa - A tool to create DANE/TLSA records. (called 'swede' before)
-# This tool is really simple and not foolproof, it doesn't check the CN in the
-# Subject field of the certificate. It also doesn't check if the supplied
-# certificate is a CA certificate if usage 1 is specified (or any other
-# checking for that matter).
-#
-# Usage is explained when running this program with --help
 #
 # This tool is loosly based on the 'dane' program in the sshfp package by Paul
 # Wouters and Christopher Olah
 #
 # Copyright 2012 Pieter Lexis <pieter.lexis@os3.nl>
 # Copyright 2014 Paul Wouters <pwouters@redhat.com>
+# Copyright 2015 Dirk Stoecker <hashslinger@dstoecker.de>
 #
-# License: GNU GENERAL PUBLIC LICENSE Version 2 or later
+# This program is free software; you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation; either version 2 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License along
+# with this program; if not, write to the Free Software Foundation, Inc.,
+# 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
 
-VERSION="2.6"
+VERSION="2.7"
 
 import sys
 import os
 import socket
 import unbound
+import subprocess
 import re
-from M2Crypto import X509, SSL
+from M2Crypto import X509, SSL, BIO, m2
 from binascii import a2b_hex, b2a_hex
 from hashlib import sha256, sha512
 from ipaddr import IPv4Address, IPv6Address
 
-DLVKEY="/etc/unbound/dlv.isc.org.key"
 ROOTKEY="none"
 cauldron = ( "/var/lib/unbound/root.anchor", "/var/lib/unbound/root.key", "/etc/unbound/root.key" )
 for root in cauldron:
@@ -36,17 +43,13 @@ for root in cauldron:
 		ROOTKEY=root
 		break
 
-def genTLSA(hostname, protocol, port, certificate, output='generic', usage=1, selector=0, mtype=1):
+def genTLSA(hostname, protocol, port, certificate, output='rfc', usage=1, selector=0, mtype=1):
 	"""This function generates a TLSARecord object using the data passed in the parameters,
 	it then validates the record and returns the RR as a string.
 	"""
 	# check if valid vars were passed
 	if hostname[-1] != '.':
 		hostname += '.'
-
-	certificate = loadCert(certificate)
-	if not certificate:
-		raise Exception('Cannot load certificate from disk')
 
 	# Create the record without a certificate
 	if port == '*':
@@ -67,6 +70,49 @@ def genTLSA(hostname, protocol, port, certificate, output='generic', usage=1, se
 	if output == 'generic':
 		return record.getRecord(generic=True)
 	return record.getRecord()
+
+def genRecords(hostname, protocol, port, chain, output='rfc', usage=1, selector=0, mtype=1):
+	cert = None
+	chained = checkChainLink(chain)[0]
+	if not chained:
+		print "WARN: Certificates don't chain"
+	certsleft = len(chain)
+	for chaincert in chain:
+		certsleft -= 1
+		if usage == 1 or usage == 3:
+			# The first cert is the end-entity cert
+			print 'Got a certificate with Subject: %s' % chaincert.get_subject()
+			cert = chaincert
+			break
+		else:
+			if (usage == 0 and chaincert.check_ca()) or usage == 2:
+				if certsleft: # don't ask for the last one
+					sys.stdout.write('Got a certificate with the following Subject:\n\t%s\nUse this as certificate to match? [y/N] ' % chaincert.get_subject())
+					input_ok = False
+					while not input_ok:
+						user_input = raw_input()
+						if user_input in ['','n','N']:
+							input_ok=True
+						elif user_input in ['y', 'Y']:
+							input_ok = True
+							cert = chaincert
+						else:
+							sys.stdout.write('Please answer Y or N')
+				else:
+					print('Using certificate with the following Subject:\n\t%s\n' % chaincert.get_subject())
+					cert = chaincert
+			if cert:
+				break
+
+	if cert: # Print the requested records based on the retrieved certificates
+		if output == 'both':
+			print genTLSA(hostname, protocol, port, cert, 'draft', usage, selector, mtype)
+			print genTLSA(hostname, protocol, port, cert, 'rfc', usage, selector, mtype)
+		else:
+			print genTLSA(hostname, protocol, port, cert, output, usage, selector, mtype)
+
+	# Clear the cert from memory (to stop M2Crypto from segfaulting)
+	cert=None
 
 def getA(hostname, secure=True):
 	"""Gets a list of A records for hostname, returns a list of ARecords"""
@@ -131,7 +177,7 @@ def getVerificationErrorReason(num):
 21: "X509_V_ERR_UNABLE_TO_VERIFY_LEAF_SIGNATURE",
 0:  "X509_V_OK"}[int(num)]
 
-def getRecords(hostname, rrtype='A', secure=True):
+def getRecords(hostname, rrtype='A', secure=True, noresolver=False):
 	"""Do a lookup of a name and a rrtype, returns a list of binary coded strings. Only queries for rr_class IN."""
 	global resolvconf
 	ctx = unbound.ub_ctx()
@@ -141,13 +187,15 @@ def getRecords(hostname, rrtype='A', secure=True):
 			ctx.add_ta_file(ROOTKEY)
 		except:
 			unbound.ub_ctx_trustedkeys(ctx,ROOTKEY)
-	if os.path.isfile(DLVKEY):
-		ctx.set_option("dlv-anchor-file:", DLVKEY)
 	# Use the local cache and emulate /etc/hosts
 	ctx.hosts("/etc/hosts")
-	if resolvconf and os.path.isfile(resolvconf):
+	if resolvconf and not noresolver:
 		ctx.resolvconf(resolvconf)
 
+	if rrtype == 52:
+		rrtypestr = "TLSA"
+	else:
+		rrtypestr = rrtype
 	if type(rrtype) == str:
 		if 'RR_TYPE_' + rrtype in dir(unbound):
 			rrtype = getattr(unbound, 'RR_TYPE_' + rrtype)
@@ -160,6 +208,11 @@ def getRecords(hostname, rrtype='A', secure=True):
 	if status == 0 and result.havedata:
 		if not result.secure:
 			if secure:
+				if not noresolver and resolvconf:
+					retval = getRecords(hostname, rrtype, secure, True)
+					print >> sys.stderr, 'Warning: initial query using resolver config file was not secure (try option --resolvconf="").'
+					resolvconf = None
+					return retval
 				# The data is insecure and a secure lookup was requested
 				raise InsecureLookupException('Error: Answer was not DNSSEC-secure')
 			else:
@@ -167,7 +220,40 @@ def getRecords(hostname, rrtype='A', secure=True):
 		# If we are here the data was either secure or insecure data is accepted
 		return result.data.raw
 	else:
-		raise DNSLookupError('Unsuccesful DNS lookup or no data returned for rrtype %s.' % rrtype)
+		raise DNSLookupError('Unsuccessful DNS lookup or no data returned for rrtype %s (%s).' % (rrtypestr, rrtype))
+
+# identical to Connection.connect() except for the last parameter
+def sslStartTLSConnect(connection, addr, starttls=None):
+        connection.socket.connect(addr)
+        connection.addr = addr
+        if starttls:
+            # primitive method, no error checks yet
+            if starttls == "smtp":
+                data = connection.socket.recv(500)
+                connection.socket.send("EHLO M2Crypto\r\n")
+                data = connection.socket.recv(500)
+                connection.socket.send("STARTTLS\r\n")
+                data = connection.socket.recv(500)
+            elif starttls == "imap":
+                data = connection.socket.recv(500)
+                connection.socket.send(". STARTTLS\r\n")
+                data = connection.socket.recv(500)
+            elif starttls == "ftp":
+                data = connection.socket.recv(500)
+                connection.socket.send("AUTH TLS\r\n")
+                data = connection.socket.recv(500)
+            elif starttls == "pop3":
+                data = connection.socket.recv(500)
+                connection.socket.send("STLS\r\n")
+                data = connection.socket.recv(500)
+        connection.setup_ssl()
+        connection.set_connect_state()
+        ret = connection.connect_ssl()
+        check = getattr(connection, 'postConnectionCheck', connection.clientPostConnectionCheck)
+        if check is not None:
+            if not check(connection.get_peer_cert(), connection.addr[0]):
+                raise Checker.SSLVerificationError('post connection check failed')
+        return ret
 
 def getHash(certificate, mtype):
 	"""Hashes the certificate based on the mtype.
@@ -214,18 +300,6 @@ def getTLSA(hostname, port=443, protocol='tcp', secure=True):
 			ret.append(TLSARecord('_%s._%s.%s' % (port, protocol.lower(), hostname), int(hexdata[0:2],16), int(hexdata[2:4],16), int(hexdata[4:6],16), hexdata[6:]))
 	return ret
 
-def loadCert(certificate):
-	"""Returns an M2Crypto.X509.X509 object"""
-	if isinstance(certificate, X509.X509):
-		# nothing to be done :-)
-		return certificate
-	try:
-		# Maybe we were passed a path
-		return X509.load_cert(certificate)
-	except:
-		# Can't load the cert
-		raise Exception('Unable to load certificate %s.' % certificate)
-
 def verifyCertMatch(record, cert):
 	"""
 	Verify the certificate with the record.
@@ -258,18 +332,156 @@ def verifyCertNameWithHostName(cert, hostname, with_msg=False):
 
 	if hostname[-1] == '.':
 		hostname = hostname[0:-1]
+	hostname = hostname.lower()
 
-	# Ugly string comparison to see if the name on the ee-cert matches with the name provided on the commandline
+	certnames = []
+	for entry in str(cert.get_subject()).lower().split("/"):
+		if entry.startswith("cn="):
+			certnames.append(entry[3:])
 	try:
-		altnames_on_cert = cert.get_ext('subjectAltName').get_value()
+		for value in re.split(", ?", cert.get_ext('subjectAltName').get_value().lower()):
+			if value.startswith("dns:"):
+				certnames.append(value[4:])
 	except:
-		altnames_on_cert = ''
-	if hostname in (str(cert.get_subject()) + altnames_on_cert):
+		pass
+	if hostname in certnames:
 		return True
+	for certname in certnames:
+		if certname[0] == '*' and hostname.endswith(certname[1:]):
+			return True
+
+	if with_msg:
+		print 'WARNING: Name on the certificate (Subject: %s, SubjectAltName: %s) doesn\'t match requested hostname (%s).' % (str(cert.get_subject()), cert.get_ext('subjectAltName').get_value(), hostname)
+	return False
+
+def checkChainLink(chain, record=None):
+	previous_issuer = None
+	chained = True
+	matched = False
+	for cert in chain:
+		if previous_issuer:
+			if not str(previous_issuer) == str(cert.get_subject()): # The chain cannot be valid
+				chained = False
+				break
+		previous_issuer = cert.get_issuer()
+		if record and verifyCertMatch(record, cert):
+			matched = True
+	return chained, matched
+
+def getLocalChain(filename, debug):
+	"""Returns list of M2Crypto.X509.X509 objects and verification result"""
+	chain = []
+	bio = BIO.openfile(filename)
+	while True:
+		cptr = m2.x509_read_pem(bio._ptr())
+		if not cptr:
+			break
+		chain.append(X509.X509(cptr, _pyfree=1))
+	if not chain:
+		raise X509Error(Err.get_error())
+	# FIXME - is this possible using the library (without a call to openssl tool)?
+	cmd = ["openssl", "verify", filename]
+	process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+	(stdout, stderr) = process.communicate()
+	if debug:
+		print >> sys.stderr, stderr
+	if stdout.endswith("OK\n"):
+		verify_result = 0
 	else:
-		if with_msg:
-			print 'WARNING: Name on the certificate (Subject: %s, SubjectAltName: %s) doesn\'t match requested hostname (%s).' % (str(cert.get_subject()), altnames_on_cert, hostname)
-		return False
+		verify_result = "%s%s" % (stdout, stderr)
+	return chain, verify_result
+
+def usageText(usage):
+	names = ["PKIX-CA", "PKIX-EE", "DANE-TA", "DANE-EE"]
+	return "Usage %d [%s]" % (usage, names[usage])
+
+def verifyChain(chain, verify_result, pre_exit, local, source):
+	if local:
+		text_cert = "Local certificate"
+		text_chain = "certificate in the local certificate chain"
+	else:
+		text_cert = "Certificate offered by the server"
+		text_chain = "certificate in the certificate chain offered by the server"
+
+	if not verifyCertNameWithHostName(cert=chain[0], hostname=str(args.host), with_msg=True):
+		# The name on the cert doesn't match the hostname... we don't verify the TLSA record
+		print 'Caution: %s does not match hostname (%s)' % (text_cert, source)
+	ut = usageText(record.usage)
+	if record.usage == 1: # End-host cert
+		chained, matched = checkChainLink((chain[0],), record)
+		if not chained:
+			print "WARN: Certificates don't chain"
+		if matched:
+			if verify_result == 0: # The cert chains to a valid CA cert according to the system-certificates
+				print 'SUCCESS (%s): %s matches the one mentioned in the TLSA record and chains to a valid CA certificate (%s)' % (ut, text_cert, source)
+			else:
+				if local:
+					reason = verify_result
+				else:
+					reason = getVerificationErrorReason(verify_result)
+				print 'FAIL (%s): %s matches the one mentioned in the TLSA record but the following error was raised during PKIX validation (%s): %s' % (ut, text_cert, source, reason)
+				if pre_exit == 0: pre_exit = 2
+			if args.debug: print 'The matched certificate has Subject: %s' % cert.get_subject()
+		else:
+			print 'FAIL: %s does not match the TLSA record (%s)' % (text_cert, source)
+			if pre_exit == 0: pre_exit = 2
+
+	elif record.usage == 0: # CA constraint
+		# FIXME: Does neither handle chain data in full cert TLSA records (type 0) correctly
+		# nor handles short certification chains
+		# In these case the chain should be completed with missing records either
+		# from TLSA or local certificate store
+
+		# Remove the first (= End-Entity cert) from the chain
+		chained, matched = checkChainLink(chain[1:], record)
+		if not chained:
+			print "WARN: Certificates don't chain"
+		if matched:
+			if cert.check_ca():
+				if verify_result == 0:
+					print 'SUCCESS (%s): A %s matches the one mentioned in the TLSA record and is a CA certificate (%s)' % (ut, text_chain, source)
+				else:
+					if local:
+						reason = verify_result
+					else:
+						reason = getVerificationErrorReason(verify_result)
+					print 'FAIL (%s): A %s matches the one mentioned in the TLSA record and is a CA certificate, but the following error was raised during PKIX validation (%s): %s' % (ut, text_chain, source, reason)
+					if pre_exit == 0: pre_exit = 2
+			else:
+				print 'FAIL (%s): A %s matches the one mentioned in the TLSA record but is not a CA certificate (%s)' % (ut, text_chain, source)
+				if pre_exit == 0: pre_exit = 2
+			if args.debug: print 'The matched certificate has Subject: %s' % cert.get_subject()
+		else:
+			print 'FAIL (%s): No %s matches the TLSA record (%s)' % (ut, text_chain, source)
+			if pre_exit == 0: pre_exit = 2
+
+	elif record.usage == 2: # Usage 2, use the cert in the record as trust anchor
+		# FIXME: Does not handle chain data in full cert TLSA records (type 0) correctly
+		# In this case the chain should be completed with missing records if chain is
+		# not complete
+		chained, matched = checkChainLink(chain, record)
+		if matched:
+			if not chained:
+				print "WARN: Certificates don't chain"
+			print 'SUCCESS (%s): A %s (including the end-entity certificate) matches the TLSA record (%s)' % (ut, text_chain, source)
+			if args.debug: print 'The matched certificate has Subject: %s' % cert.get_subject()
+		else:
+			if not chained:
+				print "FAIL: Certificates don't chain"
+			print 'FAIL (%s): No %s (including the end-entity certificate) matches the TLSA record (%s)' % (ut, text_chain, source)
+			if pre_exit == 0: pre_exit = 2
+
+	elif record.usage == 3: # EE cert MUST match
+		chained, matched = checkChainLink((chain[0],), record)
+		if not chained:
+			print "WARN: Certificates don't chain"
+		if matched:
+			print 'SUCCESS (%s): %s matches the TLSA record (%s)' % (ut, text_cert, source)
+			if args.debug: print 'The matched certificate has Subject: %s' % chain[0].get_subject()
+		else:
+			print 'FAIL (%s): %s does not match the TLSA record (%s)' % (ut, text_cert, source)
+			if pre_exit == 0: pre_exit = 2
+	return pre_exit
 
 class TLSARecord:
 	"""When instanciated, this class contains all the fields of a TLSA record.
@@ -310,11 +522,11 @@ class TLSARecord:
 			if self.getPort() != '*':
 				err.append('Port %s not a number' % self.getPort())
 		if not self.usage in [0,1,2,3]:
-			err.append('Usage: invalid (%s is not one of 0, 1, 2 or 3)' % self.usage)
+			err.append('Usage: invalid (%s is not one of 0 [PKIX-CA], 1 [PKIX-EE], 2 [DANE-TA] or 3 [DANE-EE])' % self.usage)
 		if not self.selector in [0,1]:
-			err.append('Selector: invalid (%s is not one of 0 or 1)' % self.selector)
+			err.append('Selector: invalid (%s is not one of 0 [Cert] or 1 [SPKI])' % self.selector)
 		if not self.mtype in [0,1,2]:
-			err.append('Matching Type: invalid (%s is not one of 0, 1 or 2)' % self.mtype)
+			err.append('Matching Type: invalid (%s is not one of 0 [FULL], 1 [SHA-256] or 2 [SHA-512])' % self.mtype)
 		if not self.isNameValid():
 			err.append('Name (%s) is not in the correct format: _portnumber._transportprotocol.hostname.dom.' % self.name)
 		# A certificate length of 0 is accepted
@@ -411,10 +623,10 @@ if __name__ == '__main__':
 	parser.add_argument('host', metavar="hostname")
 
 	parser.add_argument('--port', '-p', action='store', default='443', help='The port, or \'*\' where running TLS is located (default: %(default)s).')
+	parser.add_argument('--starttls', '-t', action='store', choices=['no', 'smtp', 'imap', 'pop3', 'ftp'], help='Protocol needs special start procedure, requires protocol name.')
 	parser.add_argument('--protocol', action='store', choices=['tcp','udp','sctp'], default='tcp', help='The protocol the TLS service is using (default: %(default)s).')
 	parser.add_argument('--only-rr', action='store_true', help='Only verify that the TLSA resource record is correct (do not check certificate)')
 	parser.add_argument('--rootkey', metavar='/PATH/TO/ROOT.KEY', action='store', help='Specify file location containing the DNSSEC root key')
-	parser.add_argument('--dlvkey', metavar='/PATH/TO/DLV.KEY', action='store', help='Specify file location containing the DNSSEC root key')
 
 	if os.path.isdir("/etc/pki/tls/certs/"):
 		cadir = "/etc/pki/tls/certs/"
@@ -432,8 +644,8 @@ if __name__ == '__main__':
 	parser.add_argument('--output', '-o', action='store', default='rfc', choices=['generic','rfc','both'], help='The type of output. Generic (RFC 3597, TYPE52), RFC (TLSA) or both (default: %(default)s).')
 
 	# Usage of the certificate
-	parser.add_argument('--usage', '-u', action='store', type=int, default=3, choices=[0,1,2,3], help='The Usage of the Certificate for Association. \'0\' for CA, \'1\' for End Entity, \'2\' for trust-anchor, \'3\' for ONLY End-Entity match (default: %(default)s).')
-	parser.add_argument('--selector', '-s', action='store', type=int, default=0, choices=[0,1], help='The Selector for the Certificate for Association. \'0\' for Full Certificate, \'1\' for SubjectPublicKeyInfo (default: %(default)s).')
+	parser.add_argument('--usage', '-u', action='store', type=int, default=3, choices=[0,1,2,3], help='The Usage of the Certificate for Association. \'0\' for CA [PKIX-CA], \'1\' for End Entity [PKIX-EE], \'2\' for trust-anchor [DANE-TA], \'3\' for ONLY End-Entity match [DANE-EE] (default: %(default)s).')
+	parser.add_argument('--selector', '-s', action='store', type=int, default=0, choices=[0,1], help='The Selector for the Certificate for Association. \'0\' for Full Certificate [Cert], \'1\' for SubjectPublicKeyInfo [SPKI] (default: %(default)s).')
 	parser.add_argument('--mtype', '-m', action='store', type=int, default=1, choices=[0,1,2], help='The Matching Type of the Certificate for Association. \'0\' for Exact match, \'1\' for SHA-256 hash, \'2\' for SHA-512 (default: %(default)s).')
 
 	args = parser.parse_args()
@@ -444,18 +656,27 @@ if __name__ == '__main__':
 		else:
 			print ("ignored specified non-existing rootkey file %s"%args.rootkey)
 
-	if args.dlvkey:
-		if os.path.isfile(args.dlvkey):
-			ROOTKEY = args.dlvkey
-		else:
-			print ("ignored nspecified non-existing dlvkey file %s"%args.dlvkey)
+	# check whether it's ASCII or needs to be converted into Punnycode
+	try:
+		args.host.decode('ascii')
+	except UnicodeDecodeError:
+		args.host = unicode(args.host, 'utf-8').encode("idna")
 
 	if args.host[-1] != '.':
 		args.host += '.'
+	snihost = args.host[0:-1]
 
-	if args.port == "25":
-		print >> sys.stdout, 'STARTTLS on port 25 is not yet supported'
-		sys.exit(1)
+	if not args.starttls:
+		if args.port == "25":
+			args.starttls = "smtp"
+		elif args.port == "143":
+			args.starttls = "imap"
+		elif args.port == "110":
+			args.starttls = "pop3"
+		elif args.port == "21":
+			args.starttls = "ftp"
+	elif args.starttls == "no":
+		args.starttls = None
 
 	global resolvconf
 	if args.resolvconf:
@@ -464,6 +685,8 @@ if __name__ == '__main__':
 		else:
 			print >> sys.stdout, '%s is not a file. Unable to use it as resolv.conf' % args.resolvconf
 			sys.exit(1)
+	else:
+		resolvconf = None
 
 	# not operations are fun!
 	secure = not args.insecure
@@ -478,8 +701,8 @@ if __name__ == '__main__':
 			# First, check if the first three fields have correct values.
 			if args.debug:
 				print 'Received the following record for name %s:' % record.name
-				print '\tUsage:\t\t\t\t%d (%s)' % (record.usage, {0:'CA Constraint', 1:'End-Entity Constraint + chain to CA', 2:'Trust Anchor', 3:'End-Entity'}.get(record.usage, 'INVALID'))
-				print '\tSelector:\t\t\t%d (%s)' % (record.selector, {0:'Certificate', 1:'SubjectPublicKeyInfo'}.get(record.selector, 'INVALID'))
+				print '\tUsage:\t\t\t\t%d (%s)' % (record.usage, {0:'CA Constraint [PKIX-CA]', 1:'End-Entity Constraint + chain to CA [PKIX-EE]', 2:'Trust Anchor [DANE-TA]', 3:'End-Entity [DANE-EE]'}.get(record.usage, 'INVALID'))
+				print '\tSelector:\t\t\t%d (%s)' % (record.selector, {0:'Certificate [Cert]', 1:'SubjectPublicKeyInfo [SPKI]'}.get(record.selector, 'INVALID'))
 				print '\tMatching Type:\t\t\t%d (%s)' % (record.mtype, {0:'Full Certificate', 1:'SHA-256', 2:'SHA-512'}.get(record.mtype, 'INVALID'))
 				print '\tCertificate for Association:\t%s' % record.cert
 
@@ -511,6 +734,13 @@ if __name__ == '__main__':
 			else:
 				addresses = getAAAA(args.host, secure=secure)
 
+			if args.certificate:
+				try:
+					chain, verify_result = getLocalChain(args.certificate, args.debug)
+					pre_exit = verifyChain(chain, verify_result, pre_exit, True, args.certificate)
+				except Exception, e:
+					print 'Could not verify local certificate: %s.' % e
+					sys.exit(0)
 			for address in addresses:
 				if args.debug:
 					print 'Got the following IP: %s' % str(address)
@@ -532,7 +762,22 @@ if __name__ == '__main__':
 					sock = None
 				connection = SSL.Connection(ctx, sock=sock)
 				try:
-					connection.connect((str(address), int(args.port)))
+					connection.set_tlsext_host_name(snihost)
+					if(args.debug):
+						print 'Did set servername %s' % snihost
+				except AttributeError:
+					print 'Could not set SNI (old M2Crypto version?)'
+				except:
+					print 'Could not set SNI'
+				try:
+					if args.starttls:
+						sslStartTLSConnect(connection, (str(address), int(args.port)), args.starttls)
+						#connection.connect((str(address), int(args.port)), args.starttls)
+					else:
+						connection.connect((str(address), int(args.port)))
+				#except TypeError:
+				#	print 'Cannot connect to %s (old M2Crypto version not supporting start script?)' % address
+				#	continue
 				except SSL.Checker.WrongHost, e:
 					# The name on the remote cert doesn't match the hostname because we connect on IP, not hostname (as we want secure lookup)
 					pass
@@ -543,73 +788,7 @@ if __name__ == '__main__':
 				verify_result = connection.get_verify_result()
 
 				# Good, now let's verify
-				if not verifyCertNameWithHostName(cert=chain[0], hostname=str(args.host), with_msg=True):
-					# The name on the cert doesn't match the hostname... we don't verify the TLSA record
-					print 'Caution: name on the cert does not match hostname'
-				if record.usage == 1: # End-host cert
-					cert = chain[0]
-					if verifyCertMatch(record, cert):
-						if verify_result == 0: # The cert chains to a valid CA cert according to the system-certificates
-							print 'SUCCESS (Usage 1): Certificate offered by the server matches the one mentioned in the TLSA record and chains to a valid CA certificate'
-						else:
-							print 'FAIL (Usage 1): Certificate offered by the server matches the one mentioned in the TLSA record but the following error was raised during PKIX validation: %s' % getVerificationErrorReason(verify_result)
-							if pre_exit == 0: pre_exit = 2
-						if args.debug: print 'The matched certificate has Subject: %s' % cert.get_subject()
-					else:
-						print 'FAIL: Certificate offered by the server does not match the TLSA record'
-						if pre_exit == 0: pre_exit = 2
-
-				elif record.usage == 0: # CA constraint
-					matched = False
-					# Remove the first (= End-Entity cert) from the chain
-					chain = chain[1:]
-					for cert in chain:
-						if verifyCertMatch(record, cert):
-							matched = True
-							continue
-					if matched:
-						if cert.check_ca():
-							if verify_result == 0:
-								print 'SUCCESS (Usage 0): A certificate in the certificate chain offered by the server matches the one mentioned in the TLSA record and is a CA certificate'
-							else:
-								print 'FAIL (Usage 0): A certificate in the certificate chain offered by the server matches the one mentioned in the TLSA record and is a CA certificate, but the following error was raised during PKIX validation: %s' % getVerificationErrorReason(verify_result)
-								if pre_exit == 0: pre_exit = 2
-						else:
-							print 'FAIL (Usage 0): A certificate in the certificate chain offered by the server matches the one mentioned in the TLSA record but is not a CA certificate'
-							if pre_exit == 0: pre_exit = 2
-						if args.debug: print 'The matched certificate has Subject: %s' % cert.get_subject()
-					else:
-						print 'FAIL (Usage 0): No certificate in the certificate chain offered by the server matches the TLSA record'
-						if pre_exit == 0: pre_exit = 2
-
-				elif record.usage == 2: # Usage 2, use the cert in the record as trust anchor
-					#FIXME: doesnt comply to the spec
-					matched = False
-					previous_issuer = None
-					for cert in chain:
-						if previous_issuer:
-							if not str(previous_issuer) == str(cert.get_subject()): # The chain cannot be valid
-								print "FAIL: Certificates don't chain"
-								break
-							previous_issuer = cert.get_issuer()
-						if verifyCertMatch(record, cert):
-							matched = True
-							continue
-					if matched:
-						print 'SUCCESS (usage 2): A certificate in the certificate chain (including the end-entity certificate) offered by the server matches the TLSA record'
-						if args.debug: print 'The matched certificate has Subject: %s' % cert.get_subject()
-					else:
-						print 'FAIL (usage 2): No certificate in the certificate chain (including the end-entity certificate) offered by the server matches the TLSA record'
-						if pre_exit == 0: pre_exit = 2
-
-				elif record.usage == 3: # EE cert MUST match
-					if verifyCertMatch(record,chain[0]):
-						print 'SUCCESS (usage 3): The certificate offered by the server matches the TLSA record'
-						if args.debug: print 'The matched certificate has Subject: %s' % chain[0].get_subject()
-					else:
-						print 'FAIL (usage 3): The certificate offered by the server does not match the TLSA record'
-						if pre_exit == 0: pre_exit = 2
-
+				pre_exit = verifyChain(chain, verify_result, pre_exit, False, address)
 				# Cleanup, just in case
 				connection.clear()
 				connection.close()
@@ -671,7 +850,22 @@ if __name__ == '__main__':
 					sock = None
 				connection = SSL.Connection(ctx, sock=sock)
 				try:
-					connection.connect((str(address), int(connection_port)))
+					connection.set_tlsext_host_name(snihost)
+					if(args.debug):
+						print 'Did set servername %s' % snihost
+				except AttributeError:
+					print 'Could not set SNI (old M2Crypto version?)'
+				except:
+					print 'Could not set SNI'
+				try:
+					if args.starttls:
+						sslStartTLSConnect(connection, (str(address), int(connection_port)), args.starttls)
+						#connection.connect((str(address), int(connection_port)), args.starttls)
+					else:
+						connection.connect((str(address), int(connection_port)))
+				#except TypeError:
+				#	print 'Cannot connect to %s (old M2Crypto version not supporting start script?)' % address
+				#	continue
 				except SSL.Checker.WrongHost:
 					pass
 				except socket.error, e:
@@ -679,45 +873,17 @@ if __name__ == '__main__':
 					continue
 
 				chain = connection.get_peer_cert_chain()
-				for chaincert in chain:
-					if int(args.usage) == 1 or int(args.usage) == 3:
-						# The first cert is the end-entity cert
-						print 'Got a certificate with Subject: %s' % chaincert.get_subject()
-						cert = chaincert
-						break
-					else:
-						if (int(args.usage) == 0 and chaincert.check_ca()) or int(args.usage) == 2:
-							sys.stdout.write('Got a certificate with the following Subject:\n\t%s\nUse this as certificate to match? [y/N] ' % chaincert.get_subject())
-							input_ok = False
-							while not input_ok:
-								user_input = raw_input()
-								if user_input in ['','n','N']:
-									input_ok=True
-								elif user_input in ['y', 'Y']:
-									input_ok = True
-									cert = chaincert
-								else:
-									sys.stdout.write('Please answer Y or N')
-						if cert:
-							break
-
-				if cert: # Print the requested records based on the retrieved certificates
-					if args.output == 'both':
-						print genTLSA(args.host, args.protocol, args.port, cert, 'draft', args.usage, args.selector, args.mtype)
-						print genTLSA(args.host, args.protocol, args.port, cert, 'rfc', args.usage, args.selector, args.mtype)
-					else:
-						print genTLSA(args.host, args.protocol, args.port, cert, args.output, args.usage, args.selector, args.mtype)
-
-				# Clear the cert from memory (to stop M2Crypto from segfaulting)
-				# And cleanup the connection and context
-				cert=None
+				genRecords(args.host, args.protocol, args.port, chain, args.output, args.usage, args.selector, args.mtype)
+				# Cleanup the connection and context
 				connection.clear()
 				connection.close()
 				ctx.close()
 
 		else: # Pass the path to the certificate to the genTLSA function
-			if args.output == 'both':
-				print genTLSA(args.host, args.protocol, args.port, args.certificate, 'draft', args.usage, args.selector, args.mtype)
-				print genTLSA(args.host, args.protocol, args.port, args.certificate, 'rfc', args.usage, args.selector, args.mtype)
-			else:
-				print genTLSA(args.host, args.protocol, args.port, args.certificate, args.output, args.usage, args.selector, args.mtype)
+			try:
+				chain, verify_result = getLocalChain(args.certificate, args.debug)
+			except Exception, e:
+				print 'Could not verify local certificate: %s.' % e
+			if args.usage == 0 or args.usage == 1 and not verify_result:
+				print 'Following error was raised during PKIX validation: %s' % verify_result
+			genRecords(args.host, args.protocol, args.port, chain, args.output, args.usage, args.selector, args.mtype)
